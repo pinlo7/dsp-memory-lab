@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 运行时生成的本地状态（含本机会话地址，不入库）
+tools/.dsp_cache.json
+tools/.dsp_gui_settings.json
+tools/class_registry.json
+
+# 本地 IDE / 工具配置
+.claude/
+.vscode/
+.idea/
