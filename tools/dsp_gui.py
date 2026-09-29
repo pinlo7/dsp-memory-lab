@@ -120,6 +120,26 @@ class App:
         self.var_autofill.trace_add("write", lambda *_: self._toggle_autofill())
         self.root.after(500, self._af_poll)
 
+        # 后台预热: 游戏在跑就立刻开始扫描, 用户点"连接"时大概率已就绪
+        self._prewarm_bag = None
+        self._prewarm_thread = None
+        try:
+            from dsp_core import find_pid
+            find_pid()
+            self._prewarm_thread = threading.Thread(target=self._prewarm, daemon=True)
+            self._prewarm_thread.start()
+            self.lbl_status.config(text="检测到游戏，后台自动连接中…")
+        except Exception:
+            pass
+
+    def _prewarm(self):
+        try:
+            b = DspBag(verbose=False)
+            b.connect()
+            self._prewarm_bag = b
+        except Exception:
+            self._prewarm_bag = None
+
     # ---------------------------------------------------------------- 后台线程
     def _run_bg(self, fn, done):
         if self.busy:
@@ -296,6 +316,12 @@ class App:
 
     def on_connect(self):
         def job():
+            # 复用后台预热: 还在扫就等它, 扫完直接拿结果
+            if self._prewarm_thread and self._prewarm_thread.is_alive():
+                self._prewarm_thread.join()
+            if self._prewarm_bag is not None:
+                b, self._prewarm_bag = self._prewarm_bag, None
+                return b
             b = DspBag(verbose=False)
             b.connect()
             return b

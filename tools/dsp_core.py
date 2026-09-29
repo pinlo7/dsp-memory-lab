@@ -90,6 +90,9 @@ def _find_pid(name: str = "DSPGAME.exe") -> int:
     return pid
 
 
+find_pid = _find_pid  # 公开别名（GUI 预热探测游戏是否在跑）
+
+
 class MBI(ctypes.Structure):
     _fields_ = [
         ("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
@@ -145,13 +148,12 @@ class DspMem:
             raise DspError(f"WriteProcessMemory failed at {addr:#x}")
 
     # --- 扫描原语（只扫私有可读写内存 = 托管堆，跳过镜像/映射/可执行）---
-    CHUNK = 4 << 20  # 4MB：大块 + 并发读，冷扫描提速的主手段
+    CHUNK = 16 << 20  # 16MB 大块: syscall 数降 4 倍
 
-    def _region_tasks(self, writable_only=True):
+    def _region_tasks(self, lo=0, hi=0x7FFFFFFFFFFF):
         mbi = MBI()
         addr = 0
         tasks = []
-        total_all = 0
         while addr < 0x7FFFFFFFFFFF:
             if not k32.VirtualQueryEx(self.h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
                 break
@@ -161,29 +163,40 @@ class DspMem:
                 and mbi.Type == MEM_PRIVATE
                 and not (prot & (PAGE_NOACCESS | PAGE_GUARD | PAGE_EXECUTE_MASK))
                 and size <= 1 << 30
+                and base + size > lo and base < hi          # 地址窗口剪枝
             ):
-                writable = bool(prot & 0x0C)  # READWRITE / WRITECOPY
-                total_all += size
-                if writable or not writable_only:
-                    for off in range(0, size, self.CHUNK):
-                        tasks.append((base + off, min(self.CHUNK, size - off)))
+                for off in range(0, size, self.CHUNK):
+                    tasks.append((base + off, min(self.CHUNK, size - off)))
             addr = base + size if base + size > addr else addr + 0x10000
-        return tasks, total_all
+        return tasks
 
-    def chunks(self, writable_only=True):
-        """并发读取所有候选块（ReadProcessMemory 线程安全，GIL 在 syscall 期间释放）。"""
+    def chunks(self, lo=0, hi=0x7FFFFFFFFFFF, zero_copy=False):
+        """并发读所有候选块。zero_copy=True 时 yield (addr, ctypes_buffer, nbytes)，
+        numpy 直接 frombuffer 免一次 11GB memcpy；find 类调用方要 bytes 用 zero_copy=False。"""
         from concurrent.futures import ThreadPoolExecutor
-        tasks, _ = self._region_tasks(writable_only)
+        tasks = self._region_tasks(lo, hi)
+
+        def _read(t):
+            a, n = t
+            buf = ctypes.create_string_buffer(n)
+            got = ctypes.c_size_t(0)
+            ok = k32.ReadProcessMemory(self.h, ctypes.c_void_p(a), buf, n, ctypes.byref(got))
+            return (a, buf, got.value) if ok and got.value else None
+
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for (addr, _n), data in zip(tasks, ex.map(lambda t: self.rd(t[0], t[1]), tasks)):
-                if data:
-                    yield addr, data
+            for r in ex.map(_read, tasks):
+                if r:
+                    if zero_copy:
+                        yield r
+                    else:
+                        yield r[0], r[1].raw[: r[2]]
 
-    def find_slots(self, values: set[int], limit: int = 200_000) -> list[int]:
-        return self.find_slots_multi({"_": values}, limit)["_"]
+    def find_slots(self, values: set[int], limit: int = 200_000, lo=0, hi=0x7FFFFFFFFFFF) -> list[int]:
+        return self.find_slots_multi({"_": values}, limit, lo, hi)["_"]
 
-    def find_slots_multi(self, value_sets: dict[str, set[int]], limit: int = 400_000) -> dict[str, list[int]]:
-        """一次内存遍历同时查找多个目标值集合（合并 pass 是提速关键）。"""
+    def find_slots_multi(self, value_sets: dict[str, set[int]], limit: int = 400_000,
+                         lo=0, hi=0x7FFFFFFFFFFF) -> dict[str, list[int]]:
+        """一次内存遍历同时查找多个目标值集合。zero_copy: numpy 直接吃 ctypes 缓冲。"""
         keys = [k for k, v in value_sets.items() if v]
         allvals: dict[int, str] = {}
         for k in keys:
@@ -193,11 +206,11 @@ class DspMem:
         out: dict[str, list[int]] = {k: [] for k in value_sets}
         if not len(lookup):
             return out
-        for base, data in self.chunks():
-            nr = len(data) // 8
+        for base, buf, nbytes in self.chunks(lo, hi, zero_copy=True):
+            nr = nbytes // 8
             if not nr:
                 continue
-            u = np.frombuffer(data[: nr * 8], np.uint64)
+            u = np.frombuffer(buf, np.uint64, count=nr)
             pos = np.clip(np.searchsorted(lookup, u), 0, len(lookup) - 1)
             sel = np.nonzero(lookup[pos] == u)[0]
             if sel.size:
@@ -289,42 +302,64 @@ class DspBag:
         return nm
 
     # ------------------------------------------------------- 合并扫描（4 次遍历）
+    WINDOW_PAD = 48 << 30  # mono 元数据/堆地址聚簇半径（实测跨度 ~16GB，留 3 倍余量）
+
     def locate(self):
         """GameData + ItemProto 一次搞定：
         pass1 字符串 -> pass2 slots==串址(得class) -> pass3 slots==class(得vtable)
-        -> pass4 slots==vtable(得实例)。两条链共享每一趟遍历。"""
+        -> pass4 slots==vtable(得实例)。两条链共享每一趟遍历。
+        提速: pass2-4 只扫 pass1 命中位置 ±48GB 窗口（mono 分配聚簇），失败自动回退全量。"""
         mem = self.mem
         t0 = time.time()
         self.log("扫描 #1/4: 类名串 …")
         strs = mem.find_bytes_multi({"GameData": b"GameData\x00", "ItemProto": b"ItemProto\x00"})
         strset = {k: set(v) for k, v in strs.items()}
-        self.log(f"   GameData 串 {len(strs['GameData'])} 处, ItemProto 串 {len(strs['ItemProto'])} 处")
+        all_hits = strs["GameData"] + strs["ItemProto"]
+        if not all_hits:
+            raise DspError("找不到类名字符串（游戏未运行/IL2CPP/元数据被剥离？）")
+        lo = max(0, min(all_hits) - self.WINDOW_PAD)
+        hi = max(all_hits) + self.WINDOW_PAD
+        self.log(f"   串 {len(all_hits)} 处; 剪枝窗口 {lo:#x}~{hi:#x}")
+
+        def _classes(slots):
+            out = {}
+            for k, locs in slots.items():
+                cands = {L - MONO_CLASS_NAME_SLOT for L in locs}
+                out[k] = {c for c in cands if mem.rq(c) == c}  # 自引用 = 真 class
+            return out
 
         self.log("扫描 #2/4: 谁存着串地址 -> MonoClass 候选 …")
-        slots = mem.find_slots_multi(strset)
-        classes: dict[str, set[int]] = {}
-        for k, locs in slots.items():
-            cands = {L - MONO_CLASS_NAME_SLOT for L in locs}
-            classes[k] = {c for c in cands if mem.rq(c) == c}  # 自引用 = 真 class
+        classes = _classes(mem.find_slots_multi(strset, lo=lo, hi=hi))
+        if not classes.get("GameData"):
+            self.log("   窗口内未命中, 回退全量 …")
+            classes = _classes(mem.find_slots_multi(strset))
         if not classes.get("GameData"):
             raise DspError("找不到 GameData 类（游戏未运行/未加载存档/被剥离元数据？）")
         self.log(f"   class*: GameData={[hex(c) for c in classes['GameData']]}")
 
         self.log("扫描 #3/4: 谁存着 class -> vtable …")
         # vtable+0 == class 常见；class 本体也满足，一并收下当 header
-        hdr = mem.find_slots_multi(classes)
+        hdr = mem.find_slots_multi(classes, lo=lo, hi=hi)
         headers = {k: set(v) | classes[k] for k, v in hdr.items()}
 
         self.log("扫描 #4/4: 谁存着 header -> 实例 …")
-        obj_slots = mem.find_slots_multi(headers, limit=2_000_0)
-        self.log(f"耗时 {time.time()-t0:.1f}s")
+        cl_gd = classes["GameData"]
 
-        cl_gd, cl_ip = classes["GameData"], classes.get("ItemProto", set())
-        gd_insts = [o for o in obj_slots["GameData"]
+        def _gd_insts(obj_slots):
+            return [o for o in obj_slots["GameData"]
                     if mem.rq(mem.rq(o) or 0) in cl_gd and o not in cl_gd]
+
+        obj_slots = mem.find_slots_multi(headers, limit=2_000_0, lo=lo, hi=hi)
+        gd = _gd_insts(obj_slots)
+        if not gd:  # 实例可能落在窗口外（Boehm 堆另开段），全量回退
+            self.log("   窗口内无实例, 回退全量 …")
+            obj_slots = mem.find_slots_multi(headers, limit=2_000_0)
+            gd = _gd_insts(obj_slots)
+        cl_ip = classes.get("ItemProto", set())
         ip_insts = [o for o in obj_slots.get("ItemProto", [])
                     if mem.rq(mem.rq(o) or 0) in cl_ip and o not in cl_ip] if cl_ip else []
-        return sorted(set(gd_insts)), sorted(set(ip_insts))
+        self.log(f"locate 总耗时 {time.time()-t0:.1f}s")
+        return sorted(set(gd)), sorted(set(ip_insts))
 
     # ------------------------------------------------------------- 验证整条链
     def _verify_chain(self, S: int | None = None) -> bool:

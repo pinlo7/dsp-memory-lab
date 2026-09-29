@@ -233,18 +233,29 @@ assert read_u32(addr) == value                        # 回读校验, 失败即�
 
 ## 9. 性能
 
-11GB 进程的扫描优化实录（冷启动 254s → 66s）：
+11GB 进程的扫描优化实录（冷启动 **254s → 66s → 55s**）：
 
 1. **合并遍历**：GameData 链和 ItemProto 链共享同一次全内存 pass
    （`find_slots_multi` 一次 numpy searchsorted 查多组目标值）——8 遍变 4 遍
-2. **大块读**：ReadProcessMemory 单次 4MB（syscall 开销主导，块越大越快）
+2. **大块读**：ReadProcessMemory 单次 16MB（syscall 开销主导，块越大越快；4MB→16MB 再省一截）
 3. **并发读**：ThreadPoolExecutor 8 线程（GIL 在 syscall 期间释放，真并行）
 4. **只扫可写私有内存**：托管堆必然是 `MEM_PRIVATE + PAGE_READWRITE`，
-   一刀砍掉镜像/映射/只读区
-5. **磁盘缓存**：`{pid, 进程创建时间, 全部关键地址}` → 下次连接先**逐字节验链**，
-   通过则 0 扫描（0.165s），不通过自动重扫。进程创建时间防 PID 复用
-6. numpy 技巧：`searchsorted + 回代比较` 做百万级集合成员测试；
+   一刀砍掉镜像/映射/只读区（注意：实测该游戏私有内存几乎全可写，此过滤收益有限，
+   别想当然——**先 profile 再优化**：纯读 11.4GB 仅 9.2s，大头是遍数×numpy）
+5. **零拷贝**：numpy `frombuffer` 直接吃 ctypes buffer，省掉每遍 11GB 的 `buf.raw[:]` memcpy
+6. **地址窗口剪枝**：mono 的元数据/类/vtable/堆在**同一会话内地址聚簇**（实测跨度 ~16GB）。
+   pass1 找到类名串后，pass2-4 只扫命中位置 ±48GB 窗口；**窗口内落空自动回退全量**
+   （剪枝必须配回退，否则换个内存布局就静默失败）
+7. **磁盘缓存**：`{pid, 进程创建时间, 全部关键地址}` → 下次连接先**逐字节验链**，
+   通过则 0 扫描（0.15s），不通过自动重扫。进程创建时间防 PID 复用
+8. **GUI 后台预热**：窗口一打开就在 daemon 线程里开扫，用户点"连接"时 join 预热线程
+   ——把"等 55 秒"变成"感知不到"。这是产品层面对算法极限的兜底
+9. numpy 技巧：`searchsorted + 回代比较` 做百万级集合成员测试；
    `find_bytes` 跨块边界用 carry 拼接（region 不连续时放弃 carry 防地址错位）
+
+**还没做但可行**：pass1 的字符串搜索理论上可跳过——类名串在 Assembly-CSharp.dll 的
+#Strings 堆里偏移固定（dnfile 可算），若能廉价定位 mono 元数据 blob 的基址（搜 4 字节
+`BSJB` 签名），所有串地址 = blob基址 + 文件偏移，pass1 从 13s 变毫秒级。
 
 ## 10. 踩坑总清单
 

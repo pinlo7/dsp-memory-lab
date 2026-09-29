@@ -49,6 +49,20 @@ python tools/dsp_bag.py --sand          # 查看沙土量 / --sand 10000 设置
 python tools/dsp_bag.py --json           # 机器可读输出
 python tools/dsp_bag.py --list-items     # itemId -> 中文名 全表（175 个）
 python tools/dsp_gui.py                  # 图形界面
+
+# 配方/生产链分析（首次扫内存 ~3 分钟生成 recipes.json，之后全离线秒查）
+python tools/recipes.py                  # 23 种初级原料 → 直接产出总览
+python tools/recipes.py --tree 铁矿 3    # 铁矿的 3 级产出树
+python tools/recipes.py --item 磁铁      # 磁铁能做什么 / 从哪来（含配方明细）
+python tools/recipes.py --rescan         # 游戏更新后强制重扫
+
+# 递归成本计算：合成某物品的全部基础原料 + 设备需求
+python tools/calc.py 宇宙矩阵 --rate 6   # 6个/min 宇宙矩阵: 12种原料 + 153台设备
+python tools/calc.py 引力透镜 --via 氢:1107 --mk 3   # 多配方物品手动选路线
+
+# 科技树分析：研究中 / 可立即研究(前置满足) / 已研究 / 锁定(缺什么前置)
+python tools/techs.py                  # 全报告（首次扫 TechProto ~2分钟, 之后读缓存秒出）
+python tools/techs.py 量子             # 关键词过滤
 ```
 
 ### 打包成 exe（免装 Python，双击即用）
@@ -72,9 +86,9 @@ python tools/build_exe.py --onedir   # 目录模式（启动更快，产物是�
 前提：游戏运行中且**已加载进星球**（主菜单时 GameData 还没构造）。
 改完数量回游戏**拿放一次该物品**，UI 才会刷新（内存数据本身即时生效，存档时带走）。
 
-> 首次连接要全内存扫描（4MB 大块 + 8 线程并发 `ReadProcessMemory`，11GB 实测约 70s）。
+> 首次连接要全内存扫描（优化后 11GB 实测 **~55s**，演进史: 254s → 66s → 55s，见 TUTORIAL §9）。
 > 成功后地址写入 `tools/.dsp_cache.json`；同一游戏会话内再次连接**毫秒级**（缓存只用几十字节读来验证）。
-> 游戏重启后缓存自动作废并重新扫描。GUI 常驻的话，整个游戏过程只需扫一次。
+> 游戏重启后缓存自动作废并重新扫描。**GUI 打开即后台预热扫描**——你填个搜索框的功夫它就绪了。
 
 ## 指针链（本版本实测，游戏更新后偏移可能变化）
 
@@ -180,7 +194,12 @@ GRID 元素的 `count ≤ stackSize` 且 stackSize ∈ {50,100,200,300} 等特�
     ├── dsp_bag.py             CLI 入口
     ├── dsp_gui.py             tkinter GUI
     ├── build_exe.py           PyInstaller 一键打包（GUI/CLI/both）
+    ├── recipes.py             配方解析：原料→产物 生产链分析（离线/重扫两模式）
+    ├── calc.py                递归成本计算：基础原料总量 + 分设备需求量
+    ├── techs.py               科技树分析：研究中/可研究(前置满足)/锁定(缺前置)
+    ├── calibrate_recipes.py   RecipeProto 字段偏移标定过程（教学：数据特征反推布局）
     ├── items.json             175 物品 id→中文名（运行时可重新生成）
+    ├── recipes.json           162 配方全数据（含 type/耗时/手搓标记，运行时可重新生成）
     ├── dump_types.py          ┐
     ├── field_types.py         ├ dnfile 静态元数据分析三件套（不依赖游戏运行）
     ├── search_roots.py        ┘
